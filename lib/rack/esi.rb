@@ -5,9 +5,10 @@ class Rack::ESI
   class Error < ::RuntimeError
   end
 
-  def initialize(app, max_depth = 5)
+  def initialize(app, max_depth = 5, ignore_content_type = false)
     @app = app
     @max_depth = max_depth.to_i
+    @ignore_content_type = ignore_content_type
   end
 
   def call(env)
@@ -21,15 +22,20 @@ class Rack::ESI
 
     status, headers, enumerable_body = original_response = @app.call(env.dup)
 
-    return original_response unless headers["Content-Type"].to_s.match(/(ht|x)ml/) # FIXME: Use another pattern
+    return original_response unless @ignore_content_type or headers["Content-Type"].to_s.match(/(ht|x)ml/) # FIXME: Use another pattern
 
     body = join_body(enumerable_body)
 
     return original_response unless body.include?("<esi:")
+    
+    body.gsub!(/<esi:comment text=".*?"\/>/,'')
+    body.gsub!(/<esi:comment text='.*?'\/>/,'')
+    body.gsub!(/<esi:remove>.*?<\/esi:remove>/,'')
+    body.gsub!(/<esi:include.*?\/>/) do |match|
 
-    xml = Hpricot.XML(body)
+      xml = Hpricot.XML(match)
 
-    xml.search("esi:include") do |include_element|
+      include_element = xml.search("esi:include").first
       raise(Error, "esi:include without @src") unless include_element["src"]
       raise(Error, "esi:include[@src] must be absolute") unless include_element["src"][0] == ?/
       
@@ -50,26 +56,19 @@ class Rack::ESI
       
       raise(Error, "#{include_element["src"]} request failed (code: #{include_status})") unless include_status == 200
       
-      new_element = Hpricot::Text.new(join_body(include_body))
-      include_element.parent.replace_child(include_element, new_element)
+      join_body(include_body)
     end
 
-    xml.search("esi:remove").remove
-
-    xml.search("esi:comment").remove
-
-    processed_body = xml.to_s
-    
     # TODO: Test this
     processed_headers = headers.merge({
-      "Content-Length" => processed_body.size.to_s,
+      "Content-Length" => body.size.to_s,
       "Cache-Control"  => "private, max-age=0, must-revalidate"
     })    
     processed_headers.delete("Expires")
     processed_headers.delete("Last-Modified")
     processed_headers.delete("ETag")    
 
-    [status, processed_headers, [processed_body]]
+    [status, processed_headers, [body]]
   end
 
   def join_body(enumerable_body)
